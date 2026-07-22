@@ -33,7 +33,7 @@
 <p align="center">
     <a href="">arXiv</a>
     &nbsp;|&nbsp;
-    <a href="">Video</a>
+    <a href="https://youtu.be/CP7h-tWWABU">Video</a>
 </p>
 
 ## Overview
