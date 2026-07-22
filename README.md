@@ -9,9 +9,9 @@
     &nbsp;
     <a href="https://wsakobe.github.io/">Shaoan Wang</a><sup>3</sup>
     &nbsp;
-    <a href="">Zibo Zhang</a><sup>4</sup>
+    <a>Zibo Zhang</a><sup>4</sup>
     <br>
-    <a href="">Weisi Situ</a><sup>1</sup>
+    <a href="https://situ-weixi.github.io/">Weisi Situ</a><sup>1</sup>
     &nbsp;
     <a href="https://yuchen2199.github.io/">Yuchen Zhou</a><sup>2</sup>
     &nbsp;
