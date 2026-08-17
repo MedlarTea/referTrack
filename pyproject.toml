@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "referTrack"
+version = "1.0"
+description = "ReferTrack evaluation (Habitat Track + offline video)"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "transformers==4.57.3",
+    "huggingface_hub>=0.23.0",
+    "accelerate>=0.31.0",
+    "peft>=0.12.0",
+    "sentencepiece>=0.1.99",
+    "safetensors>=0.4.3",
+    "einops>=0.7.0",
+    "ultralytics",
+    "imageio[ffmpeg]",
+    "opencv-python",
+    "Pillow",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+exclude = ["data*", "examples", "habitat-lab*", "scripts*"]
+
+[tool.wheel]
+exclude = ["data*", "examples", "habitat-lab*", "scripts*"]

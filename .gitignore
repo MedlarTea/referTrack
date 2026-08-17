@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# No trailing slash: these are often local symlinks, which a trailing slash would not match.
+data/logs
+data/scene_datasets
+data/humanoids
+data/hssd-data
+data/hssd_data
+
+# Local caches for the vision towers, usually symlinked to a shared download dir.
+/facebook
+/google
+
+*.pt
+*.pth
+*.bin
+*.safetensors
+yolo11*.pt
+
+outputs/
+logs/
+*.mp4
+*.npy
+*.npz
+
+.vscode/
+.idea/
+.DS_Store
+*.egg-info/
+build/
+dist/
