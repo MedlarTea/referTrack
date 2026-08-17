@@ -48,13 +48,6 @@
     <img src="assets/method.png" alt="ReferTrack method overview" width="95%">
 </p>
 
-This repository is an **evaluation release**. It lets you:
-
-1. Run the released single-view checkpoint in **Habitat Track** closed-loop eval (EVT-Bench DT / STT / AT).
-2. Run the same model on **an arbitrary forward-view video** (or image folder) and write a visualization.
-
-Training code, the Refer-QA dataset, and the data engine are **not** included in this tree (see [TODO](#todo-list)).
-
 ---
 
 ## 📢 News
