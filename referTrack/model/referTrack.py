@@ -1,4 +1,4 @@
-"""ReferTrack: referring-then-tracking VLA (eval).
+"""ReferTrack: referring-then-tracking VLA.
 
 Single-file model. Checkpoint keys stay `llm / proj / tvi / planner / act_token /
 null_bbox_emb` — class rename does not change the .pt.
@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from referTrack.constants import (
@@ -191,6 +192,10 @@ class ReferTrack(nn.Module):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        if cfg.gradient_checkpointing:
+            self.llm.enable_input_require_grads()
+            self.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if cfg.use_lora:
             from peft import LoraConfig, TaskType, get_peft_model
@@ -576,6 +581,217 @@ class ReferTrack(nn.Module):
         ids = token_id.to(device).view(1, 1).expand(batch_size, 1)
         return emb_layer(ids)  # (B, 1, D)
 
+    def _check_alpha(self, alpha: Optional[torch.Tensor]) -> None:
+        if alpha is None:
+            return
+        valid_shape = (
+            (alpha.dim() == 2 and alpha.size(-1) == self.action_dims)
+            or (alpha.dim() == 3 and alpha.size(1) == 1 and alpha.size(-1) == self.action_dims)
+        )
+        if not valid_shape:
+            raise ValueError(
+                f"alpha must be (B, {self.action_dims}) or (B, 1, {self.action_dims}), "
+                f"got {tuple(alpha.shape)}"
+            )
+
+    def _scale_actions(self, a_hat: torch.Tensor, alpha: Optional[torch.Tensor]) -> torch.Tensor:
+        if alpha is None:
+            return a_hat * self.alpha_task
+        a_alpha = alpha.to(a_hat.device, a_hat.dtype)
+        if a_alpha.dim() == 2:
+            a_alpha = a_alpha.unsqueeze(1)
+        return a_hat * a_alpha
+
+    def _build_context(
+        self,
+        vis: torch.Tensor,
+        cand_bbox: torch.Tensor,
+        cand_slot_valid: torch.Tensor,
+        instructions: Optional[List[str]],
+        instruction_input_ids: Optional[torch.Tensor],
+        instruction_attention_mask: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``[instr, <cat>, catalog, </cat>, <vis>, vis, </vis>, <reasoning>]`` embeddings and mask."""
+        B = vis.size(0)
+        if instruction_input_ids is not None and instruction_attention_mask is not None:
+            txt_emb, txt_mask = self._embed_text_from_ids(
+                instruction_input_ids, instruction_attention_mask, device
+            )
+        else:
+            if instructions is None:
+                raise ValueError(
+                    "Either instructions or (instruction_input_ids, instruction_attention_mask) must be provided"
+                )
+            txt_emb, txt_mask = self._embed_text(instructions, device)
+
+        cat_emb, cat_mask = self._embed_candidate_catalog(cand_bbox, cand_slot_valid, device)
+        context_seq = torch.cat([
+            txt_emb,
+            self._marker_emb(self.cat_open_id, B, device), cat_emb,
+            self._marker_emb(self.cat_close_id, B, device),
+            self._marker_emb(self.vis_open_id, B, device), vis,
+            self._marker_emb(self.vis_close_id, B, device),
+            self._marker_emb(self.reasoning_open_id, B, device),
+        ], dim=1).to(self.llm.dtype)
+
+        ones = lambda n: torch.ones(B, n, dtype=torch.long, device=device)
+        context_mask = torch.cat([
+            txt_mask.to(device),
+            ones(1), cat_mask.to(device), ones(1),
+            ones(1), ones(vis.size(1)), ones(1),
+            ones(1),
+        ], dim=1)
+        return context_seq, context_mask
+
+    def _nav_vis(
+        self,
+        coarse_tokens: torch.Tensor,
+        coarse_tidx: torch.Tensor,
+        fine_tokens: torch.Tensor,
+        fine_tidx: torch.Tensor,
+        bbox_hist: Optional[torch.Tensor],
+        bbox_hist_valid: Optional[torch.Tensor],
+        yaw_hist: Optional[torch.Tensor],
+        yaw_curr: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """History coarse tokens get TVBI; current-frame fine tokens get no bbox,
+        because at inference the current target box is only known after the CoT slot."""
+        proj_dtype = next(self.proj.parameters()).dtype
+        vis_c = self.proj(coarse_tokens.to(device=device, dtype=proj_dtype))
+        vis_f = self.proj(fine_tokens.to(device=device, dtype=proj_dtype))
+        vis_c = self._interleave_tvi(
+            vis_c, coarse_tidx.to(device), token_size=4,
+            yaw_per_frame=yaw_hist,
+            bbox_per_frame=bbox_hist.to(device) if bbox_hist is not None else None,
+            bbox_valid_per_frame=bbox_hist_valid.to(device) if bbox_hist_valid is not None else None,
+        )
+        vis_f = self._interleave_tvi(
+            vis_f, fine_tidx.to(device), token_size=64,
+            yaw_per_frame=yaw_curr,
+            bbox_per_frame=None,
+        )
+        return torch.cat([vis_c, vis_f], dim=1)
+
+    def _slot_logits(self, h: torch.Tensor, cand_slot_valid: torch.Tensor) -> torch.Tensor:
+        """Next-token logits restricted to the catalog tokens; invalid slots are -inf."""
+        lm_head = self.llm.get_output_embeddings()
+        logits_full = lm_head(h.to(lm_head.weight.dtype))
+        sub_logits = logits_full.index_select(dim=-1, index=self.cand_token_ids.to(h.device))
+        return sub_logits.masked_fill(~cand_slot_valid.to(h.device), float("-inf"))
+
+    def forward_refer_navigation(
+        self,
+        coarse_tokens: torch.Tensor,                  # (B, H*4, feat)
+        coarse_tidx: torch.Tensor,                    # (B, H*4)
+        fine_tokens: torch.Tensor,                    # (B, 64, feat)
+        fine_tidx: torch.Tensor,                      # (B, 64)
+        cand_bbox: torch.Tensor,                      # (B, CAT_LEN, 4)
+        cand_slot_valid: torch.Tensor,                # (B, CAT_LEN) bool
+        target_slot: torch.Tensor,                    # (B,) long; NO_EXIST = max_candidates
+        bbox_hist: torch.Tensor,                      # (B, H, 4) normalized
+        bbox_curr: Optional[torch.Tensor] = None,
+        instructions: Optional[List[str]] = None,
+        instruction_input_ids: Optional[torch.Tensor] = None,
+        instruction_attention_mask: Optional[torch.Tensor] = None,
+        yaw_hist: Optional[torch.Tensor] = None,
+        yaw_curr: Optional[torch.Tensor] = None,
+        alpha: Optional[torch.Tensor] = None,
+        return_pred: bool = False,
+        bbox_hist_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Teacher-forced Refer-Nav training forward.
+
+        ``[context, <PRED_SLOT>=GT, </reasoning>, <act>]``; returns
+        ``(trajectory, loss_cot, sub_logits, pred_slot)``. ``bbox_curr`` is unused.
+        """
+        device = next(self.parameters()).device
+        B = coarse_tokens.size(0)
+        self._check_alpha(alpha)
+
+        vis = self._nav_vis(
+            coarse_tokens, coarse_tidx, fine_tokens, fine_tidx,
+            bbox_hist, bbox_hist_valid, yaw_hist, yaw_curr, device,
+        )
+        context_seq, context_mask = self._build_context(
+            vis, cand_bbox, cand_slot_valid,
+            instructions, instruction_input_ids, instruction_attention_mask, device,
+        )
+        pred_ids = self.cand_token_ids.to(device)[target_slot.to(device)]
+        seq = torch.cat([
+            context_seq,
+            self.llm.get_input_embeddings()(pred_ids.view(B, 1)),
+            self._marker_emb(self.reasoning_close_id, B, device),
+            self.act_token.expand(B, 1, -1),
+        ], dim=1).to(self.llm.dtype)
+        attn = torch.cat([context_mask, torch.ones(B, 3, dtype=torch.long, device=device)], dim=1)
+
+        out = self.llm(inputs_embeds=seq, attention_mask=attn, output_hidden_states=True, use_cache=False)
+        last_hs = out.hidden_states[-1]
+
+        sub_logits = self._slot_logits(last_hs[:, context_seq.size(1) - 1, :], cand_slot_valid)
+        loss_cot = F.cross_entropy(sub_logits.float(), target_slot.to(device))
+
+        a_hat = self.planner(last_hs[:, -1, :].to(next(self.planner.parameters()).dtype))
+        tau_pred = self._scale_actions(a_hat, alpha)
+
+        if return_pred:
+            return tau_pred.float(), loss_cot, sub_logits.detach(), sub_logits.argmax(dim=-1)
+        return tau_pred.float(), loss_cot, None, None
+
+    def forward_refer_qa(
+        self,
+        coarse_tokens: torch.Tensor,                  # (B, N, feat)
+        coarse_tidx: torch.Tensor,                    # (B, N)
+        cand_bbox: torch.Tensor,                      # (B, CAT_LEN, 4)
+        cand_slot_valid: torch.Tensor,                # (B, CAT_LEN) bool
+        target_slot: torch.Tensor,                    # (B,) long
+        fine_tokens: Optional[torch.Tensor] = None,   # (B, 64, feat)
+        fine_tidx: Optional[torch.Tensor] = None,     # (B, 64)
+        instructions: Optional[List[str]] = None,
+        instruction_input_ids: Optional[torch.Tensor] = None,
+        instruction_attention_mask: Optional[torch.Tensor] = None,
+        return_pred: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Refer-QA on static images: same CoT format as navigation, TI tokens only,
+        no ``<act>``. Returns ``(loss, sub_logits, pred_slot)``."""
+        device = next(self.parameters()).device
+        B = coarse_tokens.size(0)
+
+        proj_dtype = next(self.proj.parameters()).dtype
+        vis = self._interleave_tvi(
+            self.proj(coarse_tokens.to(device=device, dtype=proj_dtype)), coarse_tidx.to(device),
+            token_size=4, skip_yaw=True,
+        )
+        if fine_tokens is not None:
+            if fine_tidx is None:
+                raise ValueError("fine_tokens provided but fine_tidx is None")
+            vis_f = self._interleave_tvi(
+                self.proj(fine_tokens.to(device=device, dtype=proj_dtype)), fine_tidx.to(device),
+                token_size=64, skip_yaw=True,
+            )
+            vis = torch.cat([vis, vis_f], dim=1)
+
+        context_seq, context_mask = self._build_context(
+            vis, cand_bbox, cand_slot_valid,
+            instructions, instruction_input_ids, instruction_attention_mask, device,
+        )
+        pred_ids = self.cand_token_ids.to(device)[target_slot.to(device)]
+        seq = torch.cat([
+            context_seq,
+            self.llm.get_input_embeddings()(pred_ids.view(B, 1)),
+            self._marker_emb(self.reasoning_close_id, B, device),
+        ], dim=1).to(self.llm.dtype)
+        attn = torch.cat([context_mask, torch.ones(B, 2, dtype=torch.long, device=device)], dim=1)
+
+        out = self.llm(inputs_embeds=seq, attention_mask=attn, output_hidden_states=True, use_cache=False)
+        sub_logits = self._slot_logits(out.hidden_states[-1][:, context_seq.size(1) - 1, :], cand_slot_valid)
+        loss = F.cross_entropy(sub_logits.float(), target_slot.to(device))
+
+        if return_pred:
+            return loss, sub_logits.detach(), sub_logits.argmax(dim=-1)
+        return loss, None, None
 
     @torch.no_grad()
     def inference_refer_navigation(
@@ -604,68 +820,19 @@ class ReferTrack(nn.Module):
         """
         device = next(self.parameters()).device
         B = coarse_tokens.size(0)
+        self._check_alpha(alpha)
 
-        if alpha is not None:
-            valid_shape = (
-                (alpha.dim() == 2 and alpha.size(-1) == self.action_dims)
-                or (alpha.dim() == 3 and alpha.size(1) == 1 and alpha.size(-1) == self.action_dims)
-            )
-            if not valid_shape:
-                raise ValueError(
-                    f"alpha must be (B, {self.action_dims}) or (B, 1, {self.action_dims}), "
-                    f"got {tuple(alpha.shape)}"
-                )
-
-        proj_dtype = next(self.proj.parameters()).dtype
-        vis_c = self.proj(coarse_tokens.to(device=device, dtype=proj_dtype))
-        vis_f_proj_raw = self.proj(fine_tokens.to(device=device, dtype=proj_dtype))
-
-        vis_c = self._interleave_tvi(
-            vis_c, coarse_tidx.to(device), token_size=4,
-            yaw_per_frame=yaw_hist,
-            bbox_per_frame=bbox_hist.to(device) if bbox_hist is not None else None,
-            bbox_valid_per_frame=bbox_hist_valid.to(device) if bbox_hist_valid is not None else None,
+        vis = self._nav_vis(
+            coarse_tokens, coarse_tidx, fine_tokens, fine_tidx,
+            bbox_hist, bbox_hist_valid, yaw_hist, yaw_curr, device,
         )
-        vis_f = self._interleave_tvi(
-            vis_f_proj_raw, fine_tidx.to(device), token_size=64,
-            yaw_per_frame=yaw_curr,
-            bbox_per_frame=None,
+        context_seq, context_mask = self._build_context(
+            vis, cand_bbox, cand_slot_valid,
+            instructions, instruction_input_ids, instruction_attention_mask, device,
         )
-
-        if instruction_input_ids is not None and instruction_attention_mask is not None:
-            txt_emb, txt_mask = self._embed_text_from_ids(
-                instruction_input_ids, instruction_attention_mask, device
-            )
-        else:
-            if instructions is None:
-                raise ValueError(
-                    "Either instructions or (instruction_input_ids, instruction_attention_mask) must be provided"
-                )
-            txt_emb, txt_mask = self._embed_text(instructions, device)
-
-        cat_emb, cat_mask = self._embed_candidate_catalog(cand_bbox, cand_slot_valid, device)
-        cat_open_e = self._marker_emb(self.cat_open_id, B, device)
-        cat_close_e = self._marker_emb(self.cat_close_id, B, device)
-        vis_open_e = self._marker_emb(self.vis_open_id, B, device)
-        vis_close_e = self._marker_emb(self.vis_close_id, B, device)
-        reas_open_e = self._marker_emb(self.reasoning_open_id, B, device)
-        reas_close_e = self._marker_emb(self.reasoning_close_id, B, device)
-
         llm_dtype = self.llm.dtype
-        context_seq = torch.cat([
-            txt_emb,
-            cat_open_e, cat_emb, cat_close_e,
-            vis_open_e, vis_c, vis_f, vis_close_e,
-            reas_open_e,
-        ], dim=1).to(llm_dtype)
-
+        reas_close_e = self._marker_emb(self.reasoning_close_id, B, device)
         ones = lambda n: torch.ones(B, n, dtype=torch.long, device=device)
-        context_mask = torch.cat([
-            txt_mask.to(device),
-            ones(1), cat_mask.to(device), ones(1),
-            ones(1), ones(vis_c.size(1) + vis_f.size(1)), ones(1),
-            ones(1),
-        ], dim=1)
 
         out_ctx = self.llm(
             inputs_embeds=context_seq,
@@ -696,15 +863,7 @@ class ReferTrack(nn.Module):
         )
         last_hs = out_step2.hidden_states[-1]
         h_act = last_hs[:, -1, :].to(next(self.planner.parameters()).dtype)
-        a_hat = self.planner(h_act)
-
-        if alpha is not None:
-            a_alpha = alpha.to(a_hat.device, a_hat.dtype)
-            if a_alpha.dim() == 2:
-                a_alpha = a_alpha.unsqueeze(1)
-            tau_pred = a_hat * a_alpha
-        else:
-            tau_pred = a_hat * self.alpha_task
+        tau_pred = self._scale_actions(self.planner(h_act), alpha)
 
         return {
             "trajectory": tau_pred.float(),

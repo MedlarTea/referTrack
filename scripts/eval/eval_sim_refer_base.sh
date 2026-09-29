@@ -29,8 +29,8 @@ MAX_NUMS="${MAX_NUMS:--1}"
 SPLITS=("dt")
 # SPLITS=("stt" "at")
 
-MODEL="ReferTrack-Qwen3-4B"
-CKPT="refertrack_qwen3_4b.pt"
+MODEL="${MODEL:-ReferTrack-Qwen3-4B}"
+CKPT="${CKPT:-refertrack_qwen3_4b.pt}"
 YOLO_MODEL="${YOLO_MODEL:-yolo11x.pt}"
 
 # CoT predicts NO_EXIST: 0 = trust planner (default); 1 = force stop

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "referTrack"
 version = "1.0"
-description = "ReferTrack evaluation (Habitat Track + offline video)"
+description = "ReferTrack: referring-then-tracking for embodied visual tracking"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
@@ -26,6 +26,9 @@ dependencies = [
     "Pillow",
     "tqdm",
 ]
+
+[project.optional-dependencies]
+train = ["deepspeed>=0.14", "tensorboard"]
 
 [tool.setuptools.packages.find]
 exclude = ["data*", "examples", "habitat-lab*", "scripts*"]
