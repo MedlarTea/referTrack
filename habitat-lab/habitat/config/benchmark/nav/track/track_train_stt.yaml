@@ -48,7 +48,7 @@ habitat:
     lab_sensors:
       agent_1_main_humanoid_detector_sensor:
         human_id: 100
-        human_pixel_threshold: 3000
+        human_pixel_threshold: 10000
         return_image: True
         is_return_image_bbox: True
 

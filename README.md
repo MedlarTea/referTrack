@@ -108,7 +108,7 @@ pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https
 git clone https://github.com/MedlarTea/referTrack.git
 cd referTrack
 pip install -e habitat-lab
-pip install -e .
+pip install -e .                  # use ".[train]" to also install DeepSpeed for training
 pip install flash-attn --no-build-isolation   # optional; falls back to SDPA
 ```
 
@@ -122,7 +122,7 @@ Scene assets follow the [TrackVLA](https://github.com/wsakobe/TrackVLA) / EVT-Be
 
 This repo already ships:
 
-- EVT-Bench episode files: `data/datasets/track/{DT,STT,AT}/val/val.json.gz`
+- EVT-Bench episode files: `data/datasets/track/{DT,STT,AT}/{val,train}/*.json.gz` (train is only needed for data collection)
 - Spot robot assets: `data/robots/hab_spot_arm/`
 - `humanoid_infos.json` at the repo root (Habitat Track reads it)
 
@@ -294,15 +294,85 @@ This release is **single-view** (`view_list=['forward']`); only `VIDEO_FORWARD` 
 
 ---
 
-## 6. What this tree contains
+## 6. Training
+
+ReferTrack is trained in two stages. Stage 1 aligns the vision projector and TVI embedder on color QA with the LLM frozen; we release its weights as `refertrack_qwen3_4b_stage1.pt`. Stage 2 (this section) trains the full model on EVT-Bench refer-navigation and SYNTH-PEDES refer-QA:
+
+\[
+\mathcal{L} = 10\,\mathcal{L}_{nav} + \mathcal{L}_{cot}^{nav} + \mathcal{L}_{cot}^{qa}
+\]
+
+Pipeline: collect EVT-Bench episodes (6.1) and synthesize refer-QA (6.2), then train (6.3) and evaluate (6.4). Install with `pip install -e ".[train]"`.
+
+### 6.1 EVT-Bench refer-navigation data
+
+A rule-based expert (A* + PID following) collects forward-view episodes on the EVT-Bench train splits (`data/datasets/track/{STT,DT,AT}/train/`, shipped with this repo). It needs the HM3D / MP3D **train** scenes and humanoids from section 2.
+
+```bash
+NUM_GPUS=8 bash scripts/data/collect_evt.sh
+# -> data/evt_bench/{stt,dt,at}_singleview_train/seed_101{,_failed}/<scene>/<k>.mp4, <k>_info.json, <k>.json
+```
+
+Then build the training samples and cache the vision tokens (YOLO11x + ByteTrack candidates, target matching, DINOv3 + SigLIP tokens). Only successful episodes are used:
+
+```bash
+NUM_GPUS=8 bash scripts/data/prepare_evt.sh
+# -> data/evt_bench_train/<split>/{frames,tracks,jsonl,vision_cache}
+```
+
+### 6.2 SYNTH-PEDES refer-QA data
+
+Download [SYNTH-PEDES](https://github.com/Zplusdragon/PLIP) (`synthpedes-dataset.json` + `Part*/`) to `data/SYNTH-PEDES/`, and put your own background images under `data/SYNTH-PEDES/backgrounds/`. Each composite pastes 2–3 people onto a 384×384 background; `info.json` records every person's box and caption, plus the caption of one absent person for `NO_EXIST` queries.
+
+```bash
+NUM_GPUS=8 bash scripts/data/prepare_refer_qa.sh
+# -> data/refer_vqa_dataset/{images,info.json,val_indices.json,vision_cache}
+```
+
+SYNTH-PEDES may only be used for non-commercial research, and the same applies to data generated from it.
+
+### 6.3 Launch
+
+```bash
+bash scripts/eval/download_ckpt.sh --stage1       # refertrack_qwen3_4b_stage1.pt for warm-start
+
+# released setting: 16 GPUs (2 nodes x 8), per-GPU batch 16, 5 epochs
+NNODES=2 NODE_RANK=0 MASTER_ADDR=<ip> bash scripts/train/train_refer.sh
+NNODES=2 NODE_RANK=1 MASTER_ADDR=<ip> bash scripts/train/train_refer.sh
+```
+
+Checkpoints are written every 2000 steps to `OUT_DIR` (default `data/logs/<date>-refertrack-qwen3-4b/`) as `model_epochXX_stepXXXXXX.pt`, next to `model_config.json`. `--resume` continues from the latest `OUT_DIR/checkpoints/ds_step*`. On smaller GPUs, add `--gradient_checkpointing` and lower `--batch_size / --qa_batch_size`.
+
+### 6.4 Evaluate your checkpoint
+
+The released checkpoint is `model_epoch03_step020000.pt` of this schedule. Training uses `alpha_xy=0.535` (waypoint scale); the released `model_config.json` sets `alpha_xy=0.8` at inference, so edit your run's `model_config.json` the same way before comparing with the reported numbers. Then run section 4 on your run directory:
+
+```bash
+MODEL=<date>-refertrack-qwen3-4b CKPT=model_epoch03_step020000.pt \
+CHUNKS=30 NUM_PARALLEL=8 bash scripts/eval/eval_sim_refer_base.sh
+```
+
+---
+
+## 7. What this tree contains
 
 | Path | Role |
 | --- | --- |
 | `scripts/eval/eval_sim_refer_base.sh` | Habitat closed-loop eval launcher |
 | `scripts/eval/eval_refer_video.sh` | Offline video inference + visualization |
 | `scripts/eval/download_ckpt.sh` | Download [ReferTrack-Qwen3-4B](https://huggingface.co/hjyeee/ReferTrack-Qwen3-4B) |
+| `scripts/data/collect_evt.sh` | Expert episode collection on EVT-Bench train splits |
+| `scripts/data/prepare_evt.sh` | Raw EVT-Bench episodes → training samples + vision cache |
+| `scripts/data/prepare_refer_qa.sh` | SYNTH-PEDES → refer-QA composites + vision cache |
+| `scripts/train/train_refer.sh` | Stage-2 training launcher |
 | `referTrack/eval/run_eval_refer_sim.py` | Habitat eval entry |
 | `referTrack/eval/run_eval_refer_video.py` | Video eval entry |
+| `referTrack/train/train_refer.py` | Training entry (DeepSpeed ZeRO-2) |
+| `referTrack/tool/collect_expert.py` | Expert collection entry (`referTrack/baseline/expert_agent.py`) |
+| `referTrack/tool/make_refer_qa.py` | Refer-QA composite synthesis |
+| `referTrack/tool/build_refer_jsonl.py` | Frames, YOLO + ByteTrack candidates, target matching |
+| `referTrack/tool/precache_features.py` | DINOv3 + SigLIP token cache |
+| `referTrack/dataset/refer_datasets.py` | Refer-navigation / refer-QA training datasets |
 | `referTrack/baseline/trained_agent_refer.py` | ReferAgent (YOLO + ByteTrack + CoT + planner) |
 | `referTrack/model/referTrack.py` | ReferTrack model |
 | `referTrack/dataset/evt_bench/` | Habitat Track registrations |
@@ -314,9 +384,8 @@ This release is **single-view** (`view_list=['forward']`); only `VIDEO_FORWARD` 
 ## TODO List
 
 * [x] Release model checkpoints and evaluation code.
-* [ ] Release the dataset.
-* [ ] Release the training code.
-* [ ] Release the data engine.
+* [x] Release the training code.
+* [x] Release the data engine (EVT-Bench expert collection, SYNTH-PEDES refer-QA synthesis).
 
 ---
 
@@ -325,6 +394,8 @@ This release is **single-view** (`view_list=['forward']`); only `VIDEO_FORWARD` 
 This codebase is built on [OmTrackVLA](https://github.com/om-ai-lab/OmTrackVLA). We thank the OmTrackVLA authors for the open-source Tracking-VLA infrastructure.
 
 Habitat evaluation follows the [EVT-Bench](https://github.com/wsakobe/TrackVLA) protocol and scene / humanoid layout from [TrackVLA](https://github.com/wsakobe/TrackVLA). We thank the TrackVLA and Habitat teams for the benchmark and simulator.
+
+The refer-QA data is synthesized from [SYNTH-PEDES](https://github.com/Zplusdragon/PLIP) (PLIP, NeurIPS 2024).
 
 ---
 
