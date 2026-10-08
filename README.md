@@ -52,6 +52,7 @@
 
 ## 📢 News
 
+* **[30/09]** Full release: training code, the data engine (EVT-Bench expert collection and SYNTH-PEDES refer-QA synthesis), and the remaining code and assets are all available.
 * **[17/08]** Evaluation code and the [ReferTrack-Qwen3-4B](https://huggingface.co/hjyeee/ReferTrack-Qwen3-4B) checkpoint are released.
 * **[23/07]** Paper is available on [arXiv](https://arxiv.org/abs/2607.20061).
 
